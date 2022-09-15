@@ -1,4 +1,4 @@
-// Halation v22.09.6
+// Halation v22.09.7
 //
 // https://github.com/hotgluebanjo
 //
@@ -32,7 +32,7 @@ __DEVICE__ inline float exp_k(float x, float y, float r0) {
 __DEVICE__ float3 exp_blur(__TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB, int p_X, int p_Y, float size) {
     // Radius is just large enough to capture most of the falloff.
     int radius = _ceil(4.5f * size);
-    float3 sum = make_float3(0.0f);
+    float3 sum = make_float3(0.0f, 0.0f, 0.0f);
     float weight_sum = 0.0f;
 
     for (int i = -radius; i <= radius; i += 1) {
