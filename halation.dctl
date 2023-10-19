@@ -1,11 +1,14 @@
-// Halation v22.09.7
+// Halation v23.10.0 (accurate snail version)
 //
 // https://github.com/hotgluebanjo
 //
 // THIS DCTL REQUIRES OPEN DOMAIN SCENE-LINEAR INPUT VALUES.
 
-// Size of the falloff filter. A higher value results in a larger pixel radius which will be slower.
-DEFINE_UI_PARAMS(SIZE, Size, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 5.0, 0.001)
+// Amount of halation. Try to use responsibly and leave at 1.0.
+DEFINE_UI_PARAMS(AMOUNT, Amount, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.001)
+
+// Size of the kernel. A higher value results in a larger pixel radius which will be slower.
+DEFINE_UI_PARAMS(SIZE, Size, DCTLUI_SLIDER_FLOAT, 20.0, 2.0, 50.0, 0.001)
 
 // How much light passes back through the green layer.
 DEFINE_UI_PARAMS(COLOR, Color, DCTLUI_SLIDER_FLOAT, 0.15, 0.0, 0.5, 0.001)
@@ -15,58 +18,81 @@ DEFINE_UI_PARAMS(COLOR, Color, DCTLUI_SLIDER_FLOAT, 0.15, 0.0, 0.5, 0.001)
 // - Minuth: https://liftgammagain.com/forum/index.php?threads/halation-and-gate-weave.13056/page-6#post-149147
 DEFINE_UI_PARAMS(METHOD, Method, DCTLUI_COMBO_BOX, 0, {PROOSA, MINUTH}, {Proosa, Minuth})
 
-__DEVICE__ inline float3 _sample(__TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB, int p_X, int p_Y) {
+typedef struct {
+    __TEXTURE__ red;
+    __TEXTURE__ grn;
+    __TEXTURE__ blu;
+    int width;
+    int height;
+} StaticImage;
+
+// This __PRIVATE__ thing is a device conditional define for OpenCL and Metal. There is not a single mention
+// of its existence anywhere.
+__DEVICE__ inline float3 sample_image(__PRIVATE__ StaticImage *img, int x, int y) {
     return make_float3(
-        _tex2D(p_TexR, p_X, p_Y),
-        _tex2D(p_TexG, p_X, p_Y),
-        _tex2D(p_TexB, p_X, p_Y)
+        _tex2D(img->red, x, y),
+        _tex2D(img->grn, x, y),
+        _tex2D(img->blu, x, y)
     );
 }
 
-__DEVICE__ inline float exp_k(float x, float y, float r0) {
-    return _expf(-_sqrtf(x*x + y*y) / r0);
+// Shell of 1/(d^2). Cuts out one more multiply.
+__DEVICE__ inline float exp_k(float x) {
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    return 1.0f / x;
 }
 
-// There doesn't seem to be a way to set a pixel on a texture, so can't get faster.
-// Pretty sure this kernel isn't separable anyway.
-__DEVICE__ float3 exp_blur(__TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB, int p_X, int p_Y, float size) {
-    // Radius is just large enough to capture most of the falloff.
-    int radius = _ceil(4.5f * size);
+__DEVICE__ float3 exp_blur(__PRIVATE__ StaticImage *img, int x, int y, int kernel_size) {
+    // N outer layers.
+    float radius = _floorf(float(kernel_size) / 2.0f);
+
     float3 sum = make_float3(0.0f, 0.0f, 0.0f);
     float weight_sum = 0.0f;
 
-    for (int i = -radius; i <= radius; i += 1) {
-        for (int j = -radius; j <= radius; j += 1) {
-            float weight = exp_k(i, j, size);
-            sum += weight * _sample(p_TexR, p_TexG, p_TexB, p_X + i, p_Y + j);
+    for (int i = -kernel_size; i <= kernel_size; i += 1) {
+        for (int j = -kernel_size; j <= kernel_size; j += 1) {
+            float dist = float(i*i + j*j);
+            // This radial masking approach is from Chris Fryer's True Exponential blur.
+            float weight = exp_k(dist) * _fmaxf((radius - _sqrtf(dist)) / radius, 0.0f);
+
+            sum += weight * sample_image(img, x + i, y + j);
             weight_sum += weight;
         }
+    }
+
+    // Shouldn't get here.
+    if (weight_sum == 0.0f) {
+        return make_float3(1.0f, 0.0f, 0.0f);
     }
 
     return sum / weight_sum;
 }
 
 __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB) {
-    float3 rgb = _sample(p_TexR, p_TexG, p_TexB, p_X, p_Y);
+    StaticImage buf = {p_TexR, p_TexG, p_TexB, p_Width, p_Height};
+    float3 input = sample_image(&buf, p_X, p_Y);
 
-    if (SIZE < 1e-10) return rgb;
-
-    float3 blurred = exp_blur(p_TexR, p_TexG, p_TexB, p_X, p_Y, SIZE);
-    float3 result, color, halated;
+    float3 blurred = exp_blur(&buf, p_X, p_Y, _ceilf(SIZE));
+    float3 color, halated, res;
 
     switch (METHOD) {
     case PROOSA:
         color = make_float3(1.0f, COLOR, 0.0f);
-        halated = rgb + (blurred * color);
-        result = halated / (color + 1.0f);
+        halated = input + (blurred * color);
+        res = halated / (color + 1.0f);
         break;
-    // Approximation of what the Texture Blend blend mode is doing.
-    // Just frequency separation.
     case MINUTH:
+        // Approximation of what the Texture Blend blend mode is doing.
+        // Just frequency separation or difference of Gaussians but with
+        // exponential falloff instead.
         color = make_float3(0.7f, 1.0f - COLOR / 3.0f, 1.0f);
-        halated = (rgb - blurred) * color;
-        result = halated + blurred;
+        halated = (input - blurred) * color;
+        res = halated + blurred;
     }
 
-    return result;
+    res = (1.0f - AMOUNT) * input + AMOUNT * res;
+
+    return res;
 }
